@@ -60,10 +60,10 @@ class ROPE(nn.Module):
         inv_freq = 1.0/(self.base **(torch.arange(0,self.dim,2, dtype = torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent= False)
 
-    def forward(self, x, seq_len):
+    def forward(self, x, seq_len,start_pos  = 0):
         
         device = x.device
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        t = torch.arange(start_pos, start_pos+seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1) 
         
@@ -137,16 +137,15 @@ class Attention(nn.Module):
 
 
             
-# ---- Phase 0 wiring: decoder layer, model, generation ----
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         hidden = cfg.hidden_size
         head_dim = hidden // cfg.num_attention_heads
-        theta = cfg.rope_parameters["rope_theta"]   # nested in transformers 5.x
+        theta = cfg.rope_parameters["rope_theta"]   
 
-        # attribute names must match Qwen's checkpoint keys
         self.input_layernorm = RMSNorm(hidden, cfg.rms_norm_eps)
         self.self_attn = Attention(hidden, cfg.num_attention_heads,
                                    cfg.num_key_value_heads, head_dim, theta)
@@ -159,7 +158,7 @@ class DecoderLayer(nn.Module):
         return x
 
 
-class QwenBody(nn.Module):          # saved as "model" in the checkpoint
+class QwenBody(nn.Module):         
     def __init__(self, cfg):
         super().__init__()
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
@@ -192,3 +191,71 @@ def greedy_generate(model, ids, n_new):
         nxt = logits[:, -1].argmax(-1, keepdim=True)
         ids = torch.cat([ids, nxt], dim=1)
     return ids
+
+import torch
+
+
+class KVCache:
+    def __init__(self,num_layers,batch,num_kv_heads,max_len,head_dim,dtype,device):
+        self.k_cache = [torch.zeros(batch, num_kv_heads, max_len, head_dim,dtype=dtype,device=device)
+            for _ in range(num_layers)
+        ]
+
+        self.v_cache = [torch.empty(batch, num_kv_heads, max_len, head_dim,dtype=dtype, device=device)
+            for _ in range(num_layers)
+        ]
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.length = 0
+        self.max_len = max_len
+
+    def update(self, layer_idx, k_new, v_new):
+        assert k_new.shape[0] == self.k_cache[layer_idx].shape[0]
+        
+
+    
+        assert k_new.shape[1] == self.num_kv_heads
+
+    
+        assert k_new.shape[3] == self.head_dim
+
+    
+        assert k_new.shape == v_new.shape
+
+    
+        T = k_new.shape[2]
+
+    
+        end = self.length + T
+
+    
+        if end > self.max_len:
+            T = k_new.shape[2]
+            end = self.length + T
+
+        if end > self.max_len:
+            raise ValueError("KV Cache capacity exceeded!")
+
+        self.k_cache[layer_idx][:, :, self.length:end, :] = k_new
+        self.v_cache[layer_idx][:, :, self.length:end, :] = v_new
+
+        return (
+            self.k_cache[layer_idx][:, :, :end, :],
+            self.v_cache[layer_idx][:, :, :end, :]
+        )
+
+    def advance(self, T):
+        if self.length + T > self.max_len:
+            raise ValueError("KV Cache capacity exceeded!")
+
+        self.length += T
+
+c = KVCache(num_layers=2, batch=1, num_kv_heads=2, max_len=16, head_dim=64,
+            dtype=torch.float32, device="cpu")
+k, v = c.update(0, torch.randn(1, 2, 3, 64), torch.randn(1, 2, 3, 64))
+print(k.shape)                                      # expect (1, 2, 3, 64)
+k, v = c.update(1, torch.randn(1, 2, 3, 64), torch.randn(1, 2, 3, 64))
+print(k.shape)                                      # still (1, 2, 3, 64)
+c.advance(3)
+k, v = c.update(0, torch.randn(1, 2, 1, 64), torch.randn(1, 2, 1, 64))
+print(k.shape)                                      # expect (1, 2, 4, 64)
