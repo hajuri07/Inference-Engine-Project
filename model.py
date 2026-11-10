@@ -71,6 +71,20 @@ class ROPE(nn.Module):
         cos = emb.cos().unsqueeze(0).unsqueeze(0)
         sin = emb.sin().unsqueeze(0).unsqueeze(0)
         return cos.to(x.dtype), sin.to(x.dtype)
+def make_mask(T, start_pos ,device):
+        S  = start_pos + T
+        q_pos = torch.arange(start_pos, S,device = device).unsqueeze(1)
+        k_pos = torch.arange(0, S, device =  device).unsqueeze(0)
+
+        return k_pos > q_pos
+
+
+
+
+
+
+
+
 
 class Attention(nn.Module):
 
@@ -192,8 +206,6 @@ def greedy_generate(model, ids, n_new):
         ids = torch.cat([ids, nxt], dim=1)
     return ids
 
-import torch
-
 
 class KVCache:
     def __init__(self,num_layers,batch,num_kv_heads,max_len,head_dim,dtype,device):
@@ -201,7 +213,7 @@ class KVCache:
             for _ in range(num_layers)
         ]
 
-        self.v_cache = [torch.empty(batch, num_kv_heads, max_len, head_dim,dtype=dtype, device=device)
+        self.v_cache = [torch.zeros(batch, num_kv_heads, max_len, head_dim,dtype=dtype, device=device)
             for _ in range(num_layers)
         ]
         self.num_kv_heads = num_kv_heads
@@ -223,15 +235,12 @@ class KVCache:
         assert k_new.shape == v_new.shape
 
     
+       
+
+    
         T = k_new.shape[2]
-
-    
         end = self.length + T
-
-    
-        if end > self.max_len:
-            T = k_new.shape[2]
-            end = self.length + T
+        
 
         if end > self.max_len:
             raise ValueError("KV Cache capacity exceeded!")
@@ -249,13 +258,6 @@ class KVCache:
             raise ValueError("KV Cache capacity exceeded!")
 
         self.length += T
+    def reset(self):
+        self.length = 0    
 
-c = KVCache(num_layers=2, batch=1, num_kv_heads=2, max_len=16, head_dim=64,
-            dtype=torch.float32, device="cpu")
-k, v = c.update(0, torch.randn(1, 2, 3, 64), torch.randn(1, 2, 3, 64))
-print(k.shape)                                      # expect (1, 2, 3, 64)
-k, v = c.update(1, torch.randn(1, 2, 3, 64), torch.randn(1, 2, 3, 64))
-print(k.shape)                                      # still (1, 2, 3, 64)
-c.advance(3)
-k, v = c.update(0, torch.randn(1, 2, 1, 64), torch.randn(1, 2, 1, 64))
-print(k.shape)                                      # expect (1, 2, 4, 64)
