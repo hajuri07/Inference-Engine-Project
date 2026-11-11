@@ -80,21 +80,16 @@ def make_mask(T, start_pos ,device):
 
 
 
-
-
-
-
-
-
 class Attention(nn.Module):
 
-    def __init__(self, hidden_size=896, num_heads=14, num_kv_heads=2, head_dim=64, rope_theta=1000000):
+    def __init__(self, hidden_size=896, num_heads=14, num_kv_heads=2, head_dim=64, rope_theta=1000000, layer_idx = 0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.num_groups = num_heads // num_kv_heads
+        self.layer_idx = layer_idx
 
         self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=True)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=True)
@@ -115,26 +110,29 @@ class Attention(nn.Module):
 
         return torch.cat(outputs, dim=1)
 
-    def forward(self, hidden_states):
-        # hidden_states shape: (batch, seq_len, hidden_size)
-        batch_size, seq_len, _ = hidden_states.shape
+    def forward(self, hidden_states,cache = None,start_pos = 0):
+        # hidden_states shape: (batch, start_pos, hidden_size)
+        batch_size, T, _ = hidden_states.shape
         
         
-        q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(hidden_states).view(batch_size, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(batch_size, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(batch_size, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
         
-        cos, sin = self.rotary_emb(q, seq_len)
+        cos, sin = self.rotary_emb(q, T, start_pos)
         q, k = apply_rotatry(q, k, cos, sin)
         
+        if cache is not None:
+            assert cache.length == start_pos        
+            k, v = cache.update(self.layer_idx, k, v) 
         
         k = self.expand_gqa_vector(k)
         v = self.expand_gqa_vector(v)
         
         
         attn_weights = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device), diagonal=1)
+        mask = make_mask(T, start_pos, q.device)
         attn_weights = attn_weights.masked_fill(mask, float("-inf"))
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         
@@ -142,7 +140,7 @@ class Attention(nn.Module):
         
         
         context_layer = context_layer.transpose(1, 2).contiguous()
-        context_layer = context_layer.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        context_layer = context_layer.view(batch_size, T, self.num_heads * self.head_dim)
         
         return self.o_proj(context_layer)
 

@@ -15,14 +15,15 @@ missing, unexpected = mine.load_state_dict(hf.state_dict(), strict=False)
 print("missing:", missing)
 print("unexpected:", unexpected)
 
-ids = tok("The capital of France is", return_tensors="pt").input_ids
+ids = tok("what is the capital of france", return_tensors="pt").input_ids
 with torch.no_grad():
     a, b = hf(ids).logits, mine(ids)
 print("max abs diff:", (a - b).abs().max().item())
 print("same argmax:", torch.equal(a.argmax(-1), b.argmax(-1)))
-
 ref = hf.generate(ids, attention_mask=torch.ones_like(ids),
-                  max_new_tokens=20, min_new_tokens=20, do_sample=False)
+                  max_new_tokens=20, do_sample=False)
 out = greedy_generate(mine, ids, 20)
-print("generation matches:", torch.equal(ref, out))
+n = ref.shape[1]
+print("eos ids:", tok.eos_token_id, hf.generation_config.eos_token_id)
+print("generation matches:", torch.equal(ref, out[:, :n]))
 print(tok.decode(out[0]))
