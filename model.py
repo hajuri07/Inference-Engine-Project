@@ -111,7 +111,7 @@ class Attention(nn.Module):
         return torch.cat(outputs, dim=1)
 
     def forward(self, hidden_states,cache = None,start_pos = 0):
-        # hidden_states shape: (batch, start_pos, hidden_size)
+        # hidden_states shape: (batch, T, hidden_size)
         batch_size, T, _ = hidden_states.shape
         
         
@@ -152,7 +152,7 @@ class Attention(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg,layer_idx:int):
         super().__init__()
         hidden = cfg.hidden_size
         head_dim = hidden // cfg.num_attention_heads
@@ -160,12 +160,12 @@ class DecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(hidden, cfg.rms_norm_eps)
         self.self_attn = Attention(hidden, cfg.num_attention_heads,
-                                   cfg.num_key_value_heads, head_dim, theta)
+                                   cfg.num_key_value_heads, head_dim, theta,layer_idx=layer_idx)
         self.post_attention_layernorm = RMSNorm(hidden, cfg.rms_norm_eps)
         self.mlp = SwiGlU(hidden, cfg.intermediate_size)
 
-    def forward(self, x):
-        x = x + self.self_attn(self.input_layernorm(x))        # norm -> attention -> add
+    def forward(self, x,cache = None, start_pos = 0):
+        x = x + self.self_attn(self.input_layernorm(x),cache = cache, start_pos = start_pos)        # norm -> attention -> add
         x = x + self.mlp(self.post_attention_layernorm(x))     # norm -> MLP -> add
         return x
 
@@ -174,26 +174,32 @@ class QwenBody(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList([DecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
+        self.layers = nn.ModuleList([DecoderLayer(cfg,i) for i in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, ids):
+    def forward(self, ids,cache = None, start_pos = 0):
         x = self.embed_tokens(ids)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x,cache = cache, start_pos = start_pos)
         return self.norm(x)
 
 
 class QwenForCausalLM(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg,):
         super().__init__()
         self.model = QwenBody(cfg)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:                  # true for Qwen2.5-0.5B
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, ids):
-        return self.lm_head(self.model(ids))         # logits: (batch, tokens, vocab)
+    def forward(self, ids,cache = None , start_pos = 0,logits_last_only=False):
+        T = ids.shape[1]
+        x = self.model(ids,cache = cache, start_pos = start_pos)
+        if cache is not None:
+            cache.advance(T)
+        if logits_last_only:
+            x = x[:, -1:, :]
+        return self.lm_head(x)         # logits: (batch, tokens, vocab)
 
 
 @torch.no_grad()
@@ -259,3 +265,31 @@ class KVCache:
     def reset(self):
         self.length = 0    
 
+@torch.no_grad()
+def generate_cached(model, ids, n_new, eos_id=None):
+    assert n_new >= 1
+
+    p = next(model.parameters())                 
+    attn = model.model.layers[0].self_attn       
+    cache = KVCache(
+        num_layers=len(model.model.layers),
+        batch=ids.shape[0],
+        num_kv_heads=attn.num_kv_heads,
+        max_len=ids.shape[1] + n_new,           
+        head_dim=attn.head_dim,
+        dtype=p.dtype,                          
+        device=p.device,
+    )
+
+    logits = model(ids, cache=cache, start_pos=0, logits_last_only=True)
+    nxt = logits[:, -1].argmax(-1, keepdim=True)         # first new token
+    ids = torch.cat([ids, nxt], dim=1)
+
+    for _ in range(n_new - 1):                           # first token already came from prefill
+        if eos_id is not None and nxt.item() == eos_id:
+            break
+        logits = model(nxt, cache=cache, start_pos=cache.length, logits_last_only=True)
+        nxt = logits[:, -1].argmax(-1, keepdim=True)
+        ids = torch.cat([ids, nxt], dim=1)
+
+    return ids
